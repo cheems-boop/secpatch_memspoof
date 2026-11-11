@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>安全补丁日期伪装</title>
+<style>
+  :root{color-scheme:dark}
+  *{box-sizing:border-box}
+  body{margin:0;padding:14px 12px 40px;background:#121417;color:#e8eaed;
+       font:14px/1.55 -apple-system,"Noto Sans CJK SC",Roboto,sans-serif}
+  h1{font-size:17px;margin:0 0 4px}
+  .sub{font-size:12px;color:#8a9099;margin-bottom:12px}
+  .card{background:#1b1e23;border:1px solid #272b31;border-radius:12px;padding:12px;margin-bottom:12px}
+  .card h2{font-size:13px;margin:0 0 10px;color:#9aa4b2;font-weight:600;letter-spacing:.02em}
+  .prop{padding:9px 0;border-bottom:1px solid #262a30}
+  .prop:last-child{border-bottom:none;padding-bottom:2px}
+  .propname{font-family:ui-monospace,monospace;font-size:11.5px;color:#c5ccd6;
+            word-break:break-word;line-height:1.35;margin-bottom:5px}
+  .propvals{display:flex;flex-wrap:wrap;gap:6px 10px;font-size:12px;color:#8a9099}
+  .propvals b{font-family:ui-monospace,monospace;font-weight:500;font-size:12px;color:#e8eaed}
+  .propvals b.ok{color:#5ddc7a}
+  .propvals b.dim{color:#9aa4b2}
+  .mono{font-family:ui-monospace,monospace;font-size:12px}
+  .ok{color:#5ddc7a}.bad{color:#ff7b72}.warn{color:#f5c451}.dim{color:#8a9099}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .row.small button{flex:1 1 auto;min-width:98px}
+  button,select,input{font:inherit;color:#e8eaed;background:#23272e;border:1px solid #333941;
+       border-radius:9px;padding:9px 11px}
+  button{flex:0 0 auto;cursor:pointer}
+  button:active{background:#2d333c}
+  button.primary{background:#2f6feb;border-color:#2f6feb}
+  button.danger{background:#3a2023;border-color:#5a2b2f;color:#ff9b93}
+  input[type=date]{flex:1 1 150px}
+  label{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:8px}
+  label span{color:#9aa4b2;font-size:12.5px}
+  select{flex:0 1 230px}
+  pre{margin:0;background:#0d0f11;border:1px solid #22262b;border-radius:10px;padding:10px;
+      font:11.5px/1.5 ui-monospace,monospace;white-space:pre-wrap;word-break:break-all;
+      max-height:46vh;overflow:auto;color:#c5ccd6}
+  .banner{border-radius:9px;padding:8px 10px;font-size:12.5px;margin-bottom:12px;background:#23272e;color:#9aa4b2}
+  .banner.bad{background:#3a2023;color:#ff9b93}
+  .banner.ok{background:#17321f;color:#78e08f}
+</style>
+</head>
+<body>
+<h1>安全补丁日期伪装</h1>
+<div class="sub">仅改写属性共享内存，不动任何分区，重启即还原</div>
+<div id="banner" class="banner">连接中…</div>
+
+<div class="card">
+  <h2>当前状态</h2>
+  <div id="rows"><div class="prop"><div class="propname dim">读取中…</div></div></div>
+  <div class="sub" id="meta" style="margin:10px 0 0"></div>
+</div>
+
+<div class="card">
+  <h2>想把日期改成多少？</h2>
+  <div class="row" style="margin-bottom:8px">
+    <input type="date" id="d">
+    <button class="primary" onclick="setDate()">写入</button>
+  </div>
+  <div class="row small">
+    <button onclick="preset('ref:pif')">跟随 PIF</button>
+    <button onclick="preset('auto')">当月 05 日</button>
+    <button onclick="preset('ref:disk')">恢复真值</button>
+  </div>
+  <div class="sub" style="margin:8px 0 0">写入后还要点下面的「立即刷新」或重启，设置页才会变</div>
+</div>
+
+<div class="card">
+  <h2>策略</h2>
+  <label><span>改完怎么生效</span>
+    <select id="refresh">
+      <option value="reboot">重启后生效（推荐）</option>
+      <option value="zygote">立即刷新（杀 zygote）</option>
+      <option value="none">只写属性不刷新</option>
+    </select></label>
+  <label><span>漂移守护</span>
+    <select id="guard"><option value="on">开</option><option value="off">关</option></select></label>
+  <label><span>守护动作</span>
+    <select id="guard_action">
+      <option value="report">只记录（痕迹最少）</option>
+      <option value="fix">自动改写</option>
+    </select></label>
+  <div class="row"><button onclick="saveStrategy()">保存策略</button></div>
+</div>
+
+<div class="card">
+  <h2>操作</h2>
+  <div class="row small">
+    <button onclick="act('apply')">立即应用属性</button>
+    <button onclick="act('refresh')">立即刷新界面</button>
+  </div>
+  <div class="row small" style="margin-top:8px">
+    <button onclick="act('audit')">痕迹体检</button>
+    <button class="danger" onclick="act('reset')">恢复真值</button>
+  </div>
+  <div class="row small" style="margin-top:8px">
+    <button onclick="restartDaemon()">重启守护进程</button>
+    <button onclick="diag()">接口诊断</button>
+  </div>
+</div>
+
+<pre id="out">就绪</pre>
+
+<script>
+const MOD = '/data/adb/modules/secpatch_memspoof';
+const PROPS = ['ro.build.version.security_patch','ro.vendor.build.security_patch'];
+const $ = id => document.getElementById(id);
+
+let cbSeq = 0;
+function hasKsu(){ return typeof ksu !== 'undefined' && ksu && typeof ksu.exec === 'function'; }
+
+// 底层调用：回调必须传「全局函数名字符串」，Java 桥只能传基本类型
+function execRaw(cmd, optsJson, timeoutMs){
+  return new Promise(res => {
+    if (!hasKsu()) return res({code:-1, out:'', err:'没有 KernelSU WebUI 接口'});
+    const name = '__ksuCb' + (++cbSeq) + '_' + Date.now();
+    let done = false;
+    const fin = r => { if (done) return; done = true; try{ delete window[name]; }catch(_){} res(r); };
+    window[name] = (errno, stdout, stderr) =>
+      fin({ code: typeof errno === 'number' ? errno : 0, out: stdout || '', err: stderr || '' });
+    setTimeout(() => fin({code:-1, out:'', err:'超时（回调未被调用）'}), timeoutMs || 12000);
+    try {
+      if (optsJson === undefined) ksu.exec(cmd, name);
+      else ksu.exec(cmd, optsJson, name);
+    } catch (e) {
+      fin({ code:-1, out:'', err:'exec 抛错: ' + e });
+    }
+  });
+}
+
+async function diag(){
+  const L = [];
+  L.push('typeof ksu = ' + (typeof ksu));
+  try { L.push('ksu 方法 = ' + (Object.keys(window.ksu || {}).join(', ') || '(空)')); } catch(e) { L.push('读 keys 失败'); }
+  try { L.push('ksu.exec arity = ' + (window.ksu && window.ksu.exec ? String(window.ksu.exec.length) : '?')); } catch(e) {}
+  const trials = [
+    ['三参 JSON{cwd:/}', JSON.stringify({cwd:'/'})],
+    ['三参 "{}"', '{}'],
+    ['三参 ""', ''],
+    ['两参', undefined],
+  ];
+  for (const t of trials){
+    const r = await execRaw('echo KSU_OK', t[1], 4000);
+    const ok = r.code === 0 && /KSU_OK/.test(r.out);
+    L.push(t[0] + ' → ' + (ok ? '✅ 可用' : '❌ ' + (r.err || ('code=' + r.code))));
+    if (ok) break;
+  }
+  log(L.join('\n'));
+  banner('诊断结果见下方输出', 'ok');
+}
+
+async function restartDaemon(){
+  banner('重启中…');
+  const r = await exec(`sh ${MOD}/bin/patchctl restart`);
+  log((r.out||'') + (r.err||''));
+  banner('完成', 'ok');
+  await load();
+}
+function exec(cmd){
+  return new Promise(res => {
+    if (!hasKsu()) return res({code:-1, out:'', err:'没有检测到 KernelSU WebUI 接口，请在管理器里打开本页'});
+    // KernelSU WebUI 的 exec：第 2 参数是 JSON 字符串，第 3 参数是【回调函数的全局名字】
+    const name = '__ksuCb' + (++cbSeq) + '_' + Date.now();
+    let done = false;
+    const fin = (r) => { if (done) return; done = true; try { delete window[name]; } catch (_) {} res(r); };
+    window[name] = function (errno, stdout, stderr) {
+      fin({ code: (typeof errno === 'number' ? errno : 0), out: stdout || '', err: stderr || '' });
+    };
+    const keys = () => { try { return Object.keys(window.ksu || {}).join(','); } catch (_) { return '?'; } };
+    setTimeout(() => fin({ code:-1, out:'', err:'15 秒无响应（回调未被调用）· ksu keys: ' + keys() }), 15000);
+    try {
+      ksu.exec(cmd, JSON.stringify({ cwd: '/' }), name);
+    } catch (e1) {
+      try { ksu.exec(cmd, '', name); }
+      catch (e2) { fin({ code:-1, out:'', err:'exec 抛错: ' + e1 + ' | ' + e2 }); }
+    }
+  });
+}
+function toast(m){ if (hasKsu() && ksu.toast) try{ ksu.toast(m); }catch(e){} }
+function banner(msg, kind){ const b=$('banner'); b.textContent=msg; b.className='banner'+(kind?' '+kind:''); }
+function log(s){ $('out').textContent = s; $('out').scrollTop = 0; }
+
+function parseKV(text){
+  const o={};
+  text.split('\n').forEach(l=>{ const i=l.indexOf('='); if(i>0) o[l.slice(0,i)] = l.slice(i+1); });
+  return o;
+}
+
+async function load(){
+  const r = await exec('sh ' + MOD + '/bin/state.sh');
+  if (r.code !== 0 && !r.out){ banner(r.err || '读取失败', 'bad'); return; }
+  const s = parseKV(r.out);
+  const tb = $('rows'); tb.innerHTML='';
+  let drift = 0;
+  PROPS.forEach(k=>{
+    const cfg = s['cfg.'+k] ?? '', now = s['now.'+k] ?? '', real = s['real.'+k] ?? '';
+    if (now && real && now !== real) drift++;
+    tb.insertAdjacentHTML('beforeend',
+      '<div class="prop">' +
+        '<div class="propname">' + k + '</div>' +
+        '<div class="propvals">' +
+          '<span>配置 <b class="dim">' + (cfg||'—') + '</b></span>' +
+          '<span>当前 <b class="' + (now && real && now!==real ? 'ok' : '') + '">' + (now||'—') + '</b></span>' +
+          '<span>真值 <b class="dim">' + (real||'—') + '</b></span>' +
+        '</div>' +
+      '</div>');
+  });
+  $('meta').textContent = `刷新策略 ${s.refresh||'-'} · 守护 ${s.guard||'-'}/${s.guard_action||'-'} · PIF ${s.pif||'-'} · 守护进程 ${s.watchd||'-'} · zygote快照 ${s.snap==='ok'?'已对齐':'待重建'}`;
+  $('refresh').value = s.refresh || 'reboot';
+  $('guard').value = s.guard || 'on';
+  $('guard_action').value = s.guard_action || 'report';
+  if (s['now.'+PROPS[0]] && !$('d').value) $('d').value = s['now.'+PROPS[0]];
+  const hasData = !!s['now.' + PROPS[0]];
+  banner(!hasKsu() ? '只读预览（未在管理器内打开）'
+        : (!hasData ? '读取失败：' + (r.err || '状态为空') + '（code=' + r.code + '）→ 已自动运行诊断'
+        : (drift ? `已伪装 ${drift} 项（磁盘未改动）` : '当前未伪装')),
+        (!hasKsu() || !hasData) ? 'bad' : 'ok');
+  if (hasKsu() && !hasData && !window.__diagDone){ window.__diagDone = 1; diag(); }
+}
+
+let lastOut = '';
+async function setOne(key, val, applyNow){
+  const flag = applyNow ? '-a ' : '';
+  const r = await exec(`sh ${MOD}/bin/setconf.sh ${flag}${key} ${val}`);
+  lastOut = ((r.out || '') + (r.err || '')).trim();
+  log(lastOut);
+  return r.code === 0;
+}
+// 两个属性只 apply 一次：前一个不带 -a，最后一个带 -a。
+// 分两次 apply 会出现 1~2 秒“一旧一新”的中间态。
+async function setBothProps(val){
+  const a = await setOne(PROPS[0], val, false);
+  const b = await setOne(PROPS[1], val, true);
+  if (a && b){
+    toast('已写入并应用（设置页需重启或刷新）');
+    banner('已写入并应用 · 点「立即刷新界面」或重启后设置页生效', 'ok');
+  } else {
+    const hint = /max_ahead/.test(lastOut) ? '（可调大 prop.conf 里的 max_ahead）' : '';
+    toast('写入失败');
+    banner('写入失败：' + (lastOut.split('\n').slice(0, 2).join(' ') || '见下方输出') + hint, 'bad');
+  }
+  await load();
+}
+async function setDate(){
+  const v = $('d').value;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return banner('请选择合法日期','bad');
+  await setBothProps(v);
+}
+async function preset(v){ await setBothProps(v); }
+async function saveStrategy(){
+  const cmds = [
+    `sh ${MOD}/bin/setconf.sh refresh ${$('refresh').value}`,
+    `sh ${MOD}/bin/setconf.sh guard ${$('guard').value}`,
+    `sh ${MOD}/bin/setconf.sh guard_action ${$('guard_action').value}`
+  ];
+  let out='';
+  for (const c of cmds){ const r = await exec(c); out += (r.out||'')+(r.err||''); }
+  log(out); toast('策略已保存'); await load();
+}
+async function act(a){
+  const map = { apply:'apply', refresh:'refresh', audit:'audit', reset:'reset' };
+  const name = map[a]; if(!name) return;
+  if (name === 'refresh' && !confirm('会重启 zygote，所有 App 被关闭（约 3 秒回锁屏）。继续？')) return;
+  banner('执行中…'); log('执行中…');
+  const r = await exec(`sh ${MOD}/bin/patchctl ${name}`);
+  log((r.out||'') + (r.err||''));
+  banner('完成', 'ok');
+  await load();
+}
+load();
+setInterval(()=>{ if (document.visibilityState==='visible') load(); }, 15000);
+</script>
+</body>
+</html>

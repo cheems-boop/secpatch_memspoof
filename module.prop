@@ -1,0 +1,6 @@
+id=secpatch_memspoof
+name=安全补丁日期伪装（仅内存）
+version=v1.4.1
+versionCode=5
+author=DeepSeek
+description=图形化修改「设置-关于手机-Android 安全更新」显示的日期。点模块页「打开」即是 WebUI，选日期/一键应用/一键刷新；点「执行」打印状态表。仅在属性共享内存改写，不写分区、不落盘，重启即还原。v1.4.1：修 max_ahead 误拦“选下个月”、失败静默（现在返回非0并在 WebUI 弹红）、并发目录锁（含 boot_id/超龄/持有者校验）；真机已验证全新安装与升级链路。

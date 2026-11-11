@@ -1,0 +1,187 @@
+#!/system/bin/sh
+# patchctl v1.1
+#   show     配置 vs 当前值（默认）
+#   diff     当前值 vs 分区真值（看伪装了几项）
+#   doctor   一键体检
+#   apply    立即重新应用（不动 zygote）
+#   refresh  应用 + 重启 zygote（设置页立刻刷新）
+#   reset    写回真值
+#   sync-pif 把目标日期回写 pif.prop（带备份）
+#   guard on|off  开关漂移守护
+#   log|status
+set -u
+export PATH=/system/bin:/system/xbin:/data/adb/ksu/bin:$PATH
+MODDIR=$(cd "${0%/*}/.." && pwd)
+. "$MODDIR/bin/lib.sh"
+
+cmd=${1:-show}; shift 2>/dev/null || true
+
+case "$cmd" in
+  show)
+    echo "配置文件: $(conf_file)"
+    printf '%-38s %-11s %s\n' "属性" "配置" "当前值"
+    for k in $(conf_keys | sort -u); do
+      printf '%-38s %-11s %s\n' "$k" "$(cfg "$k")" "$(getprop "$k")"
+    done
+    echo "refresh=$(cfg refresh)  guard=$(cfg guard)  interval=$(cfg guard_interval)"
+    ;;
+  diff)
+    echo "属性                                        分区真值    当前值      状态"
+    n=0
+    for k in $(conf_keys | sort -u); do
+      real=$(kv "$BASE" "$k")
+      [ -z "$real" ] && real=$(disk_val "$k")
+      cur=$(getprop "$k" 2>/dev/null)
+      if [ -n "$real" ] && [ "$real" != "$cur" ]; then st="已伪装"; n=$((n+1))
+      elif [ -n "$real" ]; then st="一致"
+      else st="无真值"
+      fi
+      printf '%-40s %-11s %-11s %s\n' "$k" "${real:-—}" "${cur:-—}" "$st"
+    done
+    echo "共 $n 项处于伪装状态（磁盘上的 build.prop 未被修改）"
+    ;;
+  doctor)
+    echo "===== 环境 ====="
+    printf '%-16s %s\n' resetprop "$RP"
+    printf '%-16s %s\n' KSU "$(/data/adb/ksud -V 2>/dev/null | head -1)"
+    printf '%-16s %s\n' SELinux "$(getenforce 2>/dev/null) / $(ls -dZ "$MODDIR" 2>/dev/null | grep -o 'u:object_r:[a-z_]*')"
+    printf '%-16s %s\n' 守护 "$(watchd_alive && echo 运行中 || echo 未运行)"
+    printf '%-16s %s\n' 日志 "$(stat -c %s "$LOG" 2>/dev/null || echo 0) 字节"
+    echo "===== 属性一致性 ====="
+    for k in $(conf_keys | sort -u); do
+      want=$(resolve "$(cfg "$k")" "$k"); cur=$(getprop "$k" 2>/dev/null)
+      if [ "$cur" = "$want" ]; then m="✓"; else m="✗"; fi
+      printf '%s %-38s 期望=%-11s 现在=%s\n' "$m" "$k" "$want" "${cur:-<无>}"
+    done
+    echo "===== 与 PIF 口径 ====="
+    p=$(pif_val); w=$(resolve "$(cfg ro.vendor.build.security_patch)" ro.vendor.build.security_patch)
+    echo "pif.prop SECURITY_PATCH = ${p:-<无>}"
+    [ -n "$p" ] && { [ "$p" = "$w" ] && echo "✓ 与模块目标一致" || echo "✗ 不一致（可执行 patchctl sync-pif）"; }
+    echo "===== zygote 快照（Build 字段同源检查） ====="
+    if [ -f "$SNAP" ]; then
+      sb=$(grep -m1 '^#boot_id=' "$SNAP" | cut -d= -f2); cb=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+      if [ "$sb" = "$cb" ]; then echo "✓ 本次开机的快照存在"; else echo "! 快照属于上次开机，重启后重建"; fi
+      grep '^ro\.' "$SNAP" 2>/dev/null | sed 's/^/    /'
+    else
+      echo "! 无快照（下次开机 post-fs-data 自动建立）"
+    fi
+    echo "===== 提示 ====="
+    echo "设置页显示值 = zygote 启动时快照；改完需重启或用 patchctl refresh"
+    echo "完整痕迹自查：patchctl audit"
+    ;;
+  audit)
+    "$MODDIR/bin/audit.sh"
+    ;;
+  apply)
+    "$MODDIR/bin/apply.sh" manual
+    tail -n 6 "$LOG"
+    ;;
+  refresh)
+    "$MODDIR/bin/refresh.sh" manual
+    echo "已触发 zygote 重启，约 3 秒后回锁屏；重新打开设置即见新日期"
+    ;;
+  reset)
+    # 必须带 --persist：否则配置仍是 ref:pif，下一次 apply 会把伪装写回来
+    "$MODDIR/bin/restore.sh" --persist
+    tail -n 6 "$LOG"
+    echo "已关闭伪装：属性已写回真值，prop.conf 已改为 ref:disk（守护不会再改回）"
+    echo "重新开启：patchctl on"
+    ;;
+  on)
+    for k in $(conf_keys | sort -u); do
+      protected "$k" && continue
+      sh "$MODDIR/bin/setconf.sh" "$k" ref:pif >/dev/null 2>&1
+    done
+    "$MODDIR/bin/apply.sh" manual >/dev/null 2>&1
+    echo "已恢复伪装（配置=ref:pif）"
+    for k in ro.build.version.security_patch ro.vendor.build.security_patch; do
+      echo "  $k=$(getprop "$k")"
+    done
+    echo "设置页需重启 或 patchctl refresh"
+    ;;
+  sync-pif)
+    v=$(resolve "$(cfg ro.vendor.build.security_patch)" ro.vendor.build.security_patch)
+    is_date "$v" || { echo "目标值非法: $v"; exit 1; }
+    n=0
+    # 两份 pif.prop 都要改，否则 PIF 与模块口径会漂移；
+    # 用 awk 逐行精确重写，避开 sed 的正则与 & 特殊字符问题。
+    for f in /data/adb/pif.prop /data/adb/modules/playintegrityfix/pif.prop; do
+      [ -f "$f" ] || continue
+      cp -f "$f" "$f.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null
+      awk -v v="$v" '
+        BEGIN { done = 0 }
+        {
+          if (!done && substr($0, 1, 15) == "SECURITY_PATCH=") { print "SECURITY_PATCH=" v; done = 1; next }
+          print
+        }
+        END { if (!done) print "SECURITY_PATCH=" v }
+      ' "$f" > "$f.tmp" && mv -f "$f.tmp" "$f"
+      echo "已写入 $f -> $(kv "$f" SECURITY_PATCH)"
+      # 备份只留最近 3 份，防止反复 sync 把 /data/adb 堆满
+      bi=0
+      for bf in $(ls -1t "$f".bak.* 2>/dev/null); do
+        bi=$((bi+1)); [ "$bi" -gt 3 ] && rm -f "$bf"
+      done
+      n=$((n+1))
+    done
+    [ "$n" -eq 0 ] && { echo "找不到 pif.prop"; exit 1; }
+    echo "原文件均备份为 *.bak.<时间戳>"
+    echo "PIF 需重启或 patchctl refresh 才读到新值"
+    ;;
+  guard)
+    v=${1:-on}
+    case "$v" in on|off) ;; *) echo "guard 只能是 on|off"; exit 1;; esac
+    sh "$MODDIR/bin/setconf.sh" guard "$v" >/dev/null
+    echo "guard=$v（watchd 3 秒内生效）"
+    ;;
+  guard-action)
+    v=${1:-report}
+    case "$v" in fix|report) ;; *) echo "只能是 fix 或 report"; exit 1;; esac
+    sh "$MODDIR/bin/setconf.sh" guard_action "$v" >/dev/null
+    echo "guard_action=$v（fix=漂移就改写；report=只记录不改写，痕迹最少）"
+    ;;
+  restart)
+    old=$(watchd_pids)
+    if [ -n "$old" ]; then
+      echo "停止旧实例: $(printf '%s' "$old" | tr '\n' ' ')"
+      for p in $old; do kill "$p" 2>/dev/null; done
+      sleep 2
+      # TERM 不理就用 -9 兼底（旧版 watchd 的 trap 有这个缺陷）
+      for p in $(watchd_pids); do kill -9 "$p" 2>/dev/null; done
+      sleep 1
+    fi
+    rm -f "$WATCHD_PID"
+    start_daemon "$MODDIR/bin/watchd.sh"
+    sleep 3
+    pids=$(watchd_pids)
+    if [ -n "$pids" ]; then
+      n=$(printf '%s\n' "$pids" | wc -l | tr -d ' ')
+      echo "已重启，实例数=$n  pid=$(printf '%s' "$pids" | tr '\n' ' ')"
+    else
+      echo "启动失败（pidfile=$(cat "$WATCHD_PID" 2>/dev/null || echo 无)）"
+      echo "--- 日志尾 ---"
+      tail -n 5 "$LOG" 2>/dev/null | sed 's/^/  /'
+    fi
+    ;;
+  log)    tail -n 40 "$LOG" ;;
+  status)
+    echo "--- watchd ---"
+    pids=$(watchd_pids)
+    if [ -z "$pids" ]; then
+      echo "(未运行)  提示：sh $MODDIR/bin/patchctl restart 可立即拉起"
+    else
+      n=$(printf '%s\n' "$pids" | wc -l | tr -d ' ')
+      echo "运行中，实例数=$n"
+      for p in $pids; do
+        echo "  pid=$p  $(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null)"
+      done
+      [ "$n" -gt 1 ] && echo "  ⚠ 存在多个实例，建议 sh $MODDIR/bin/patchctl restart"
+    fi
+    echo "--- 属性 ---"
+    for k in ro.build.version.security_patch ro.vendor.build.security_patch; do
+      echo "$k=$(getprop "$k")"
+    done
+    ;;
+  *) echo "用法: patchctl {show|diff|doctor|audit|apply|refresh|reset|on|sync-pif|guard on|off|restart|log|status}" ;;
+esac
+exit 0
